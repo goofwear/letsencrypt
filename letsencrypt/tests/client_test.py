@@ -120,18 +120,22 @@ class ClientTest(unittest.TestCase):
         os.chmod(tmp_path, 0o755)  # TODO: really??
 
         certr = mock.MagicMock(body=test_util.load_cert(certs[0]))
-        cert1 = test_util.load_cert(certs[1])
-        cert2 = test_util.load_cert(certs[2])
+        chain_cert = [test_util.load_cert(certs[1]),
+                      test_util.load_cert(certs[2])]
         candidate_cert_path = os.path.join(tmp_path, "certs", "cert.pem")
         candidate_chain_path = os.path.join(tmp_path, "chains", "chain.pem")
+        candidate_fullchain_path = os.path.join(tmp_path, "chains", "fullchain.pem")
 
-        cert_path, chain_path = self.client.save_certificate(
-            certr, [cert1, cert2], candidate_cert_path, candidate_chain_path)
+        cert_path, chain_path, fullchain_path = self.client.save_certificate(
+            certr, chain_cert, candidate_cert_path, candidate_chain_path,
+            candidate_fullchain_path)
 
         self.assertEqual(os.path.dirname(cert_path),
                          os.path.dirname(candidate_cert_path))
         self.assertEqual(os.path.dirname(chain_path),
                          os.path.dirname(candidate_chain_path))
+        self.assertEqual(os.path.dirname(fullchain_path),
+                         os.path.dirname(candidate_fullchain_path))
 
         with open(cert_path, "r") as cert_file:
             cert_contents = cert_file.read()
@@ -159,8 +163,29 @@ class ClientTest(unittest.TestCase):
             domain='foo.bar',
             fullchain_path='fullchain',
             key_path=os.path.abspath("key"))
-        self.assertEqual(installer.save.call_count, 1)
+        self.assertEqual(installer.save.call_count, 2)
         installer.restart.assert_called_once_with()
+
+    def test_deploy_certificate_restart_failure_with_recovery(self):
+        installer = mock.MagicMock()
+        installer.restart.side_effect = [errors.PluginError, None]
+        self.client.installer = installer
+
+        self.assertRaises(errors.PluginError, self.client.deploy_certificate,
+                          ["foo.bar"], "key", "cert", "chain", "fullchain")
+        installer.rollback_checkpoints.assert_called_once_with()
+        self.assertEqual(installer.restart.call_count, 2)
+
+    def test_deploy_certificate_restart_failure_without_recovery(self):
+        installer = mock.MagicMock()
+        installer.restart.side_effect = errors.PluginError
+        installer.rollback_checkpoints.side_effect = errors.ReverterError
+        self.client.installer = installer
+
+        self.assertRaises(errors.PluginError, self.client.deploy_certificate,
+                          ["foo.bar"], "key", "cert", "chain", "fullchain")
+        installer.rollback_checkpoints.assert_called_once_with()
+        self.assertEqual(installer.restart.call_count, 1)
 
     @mock.patch("letsencrypt.client.enhancements")
     def test_enhance_config(self, mock_enhancements):

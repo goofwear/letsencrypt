@@ -57,13 +57,17 @@ class DvAuthError(AuthorizationError):
 
 
 # Authenticator - Challenge specific errors
-class DvsniError(DvAuthError):
-    """Let's Encrypt DVSNI error."""
+class TLSSNI01Error(DvAuthError):
+    """Let's Encrypt TLSSNI01 error."""
 
 
 # Plugin Errors
 class PluginError(Error):
     """Let's Encrypt Plugin error."""
+
+
+class PluginSelectionError(Error):
+    """A problem with plugin/configurator selection or setup"""
 
 
 class NoInstallationError(PluginError):

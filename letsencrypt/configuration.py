@@ -37,10 +37,10 @@ class NamespaceConfig(object):
     def __init__(self, namespace):
         self.namespace = namespace
 
-        if self.simple_http_port == self.dvsni_port:
+        if self.http01_port == self.tls_sni_01_port:
             raise errors.Error(
-                "Trying to run SimpleHTTP and DVSNI "
-                "on the same port ({0})".format(self.dvsni_port))
+                "Trying to run http-01 and tls-sni-01 "
+                "on the same port ({0})".format(self.tls_sni_01_port))
 
     def __getattr__(self, name):
         return getattr(self.namespace, name)
@@ -78,11 +78,11 @@ class NamespaceConfig(object):
             self.namespace.work_dir, constants.TEMP_CHECKPOINT_DIR)
 
     @property
-    def simple_http_port(self):  # pylint: disable=missing-docstring
-        if self.namespace.simple_http_port is not None:
-            return self.namespace.simple_http_port
+    def http01_port(self):  # pylint: disable=missing-docstring
+        if self.namespace.http01_port is not None:
+            return self.namespace.http01_port
         else:
-            return challenges.SimpleHTTPResponse.PORT
+            return challenges.HTTP01Response.PORT
 
 
 class RenewerConfiguration(object):

@@ -11,10 +11,8 @@ import six
 import zope.interface
 
 from acme import challenges
-from acme import crypto_util as acme_crypto_util
 from acme import standalone as acme_standalone
 
-from letsencrypt import achallenges
 from letsencrypt import errors
 from letsencrypt import interfaces
 
@@ -29,20 +27,20 @@ class ServerManager(object):
 
     Manager for `ACMEServer` and `ACMETLSServer` instances.
 
-    `certs` and `simple_http_resources` correspond to
+    `certs` and `http_01_resources` correspond to
     `acme.crypto_util.SSLSocket.certs` and
-    `acme.crypto_util.SSLSocket.simple_http_resources` respectively. All
+    `acme.crypto_util.SSLSocket.http_01_resources` respectively. All
     created servers share the same certificates and resources, so if
-    you're running both TLS and non-TLS instances, SimpleHTTP handlers
+    you're running both TLS and non-TLS instances, HTTP01 handlers
     will serve the same URLs!
 
     """
     _Instance = collections.namedtuple("_Instance", "server thread")
 
-    def __init__(self, certs, simple_http_resources):
+    def __init__(self, certs, http_01_resources):
         self._instances = {}
         self.certs = certs
-        self.simple_http_resources = simple_http_resources
+        self.http_01_resources = http_01_resources
 
     def run(self, port, challenge_type):
         """Run ACME server on specified ``port``.
@@ -52,33 +50,34 @@ class ServerManager(object):
 
         :param int port: Port to run the server on.
         :param challenge_type: Subclass of `acme.challenges.Challenge`,
-            either `acme.challenge.SimpleHTTP` or `acme.challenges.DVSNI`.
+            either `acme.challenge.HTTP01` or `acme.challenges.TLSSNI01`.
 
         :returns: Server instance.
         :rtype: ACMEServerMixin
 
         """
-        assert challenge_type in (challenges.DVSNI, challenges.SimpleHTTP)
+        assert challenge_type in (challenges.TLSSNI01, challenges.HTTP01)
         if port in self._instances:
             return self._instances[port].server
 
         address = ("", port)
         try:
-            if challenge_type is challenges.DVSNI:
-                server = acme_standalone.DVSNIServer(address, self.certs)
-            else:  # challenges.SimpleHTTP
-                server = acme_standalone.SimpleHTTPServer(
-                    address, self.simple_http_resources)
+            if challenge_type is challenges.TLSSNI01:
+                server = acme_standalone.TLSSNI01Server(address, self.certs)
+            else:  # challenges.HTTP01
+                server = acme_standalone.HTTP01Server(
+                    address, self.http_01_resources)
         except socket.error as error:
             raise errors.StandaloneBindError(error, port)
 
-        # if port == 0, then random free port on OS is taken
-        # pylint: disable=no-member
-        host, real_port = server.socket.getsockname()
-        thread = threading.Thread(target=server.serve_forever2)
-        logger.debug("Starting server at %s:%d", host, real_port)
+        thread = threading.Thread(
+            # pylint: disable=no-member
+            target=server.serve_forever)
         thread.start()
 
+        # if port == 0, then random free port on OS is taken
+        # pylint: disable=no-member
+        real_port = server.socket.getsockname()[1]
         self._instances[real_port] = self._Instance(server, thread)
         return server
 
@@ -89,7 +88,9 @@ class ServerManager(object):
 
         """
         instance = self._instances[port]
-        instance.server.shutdown2()
+        logger.debug("Stopping server at %s:%d...",
+                     *instance.server.socket.getsockname()[:2])
+        instance.server.shutdown()
         instance.thread.join()
         del self._instances[port]
 
@@ -107,7 +108,7 @@ class ServerManager(object):
                     in six.iteritems(self._instances))
 
 
-SUPPORTED_CHALLENGES = set([challenges.DVSNI, challenges.SimpleHTTP])
+SUPPORTED_CHALLENGES = set([challenges.TLSSNI01, challenges.HTTP01])
 
 
 def supported_challenges_validator(data):
@@ -136,25 +137,21 @@ class Authenticator(common.Plugin):
     """Standalone Authenticator.
 
     This authenticator creates its own ephemeral TCP listener on the
-    necessary port in order to respond to incoming DVSNI and SimpleHTTP
+    necessary port in order to respond to incoming tls-sni-01 and http-01
     challenges from the certificate authority. Therefore, it does not
     rely on any existing server program.
-
     """
     zope.interface.implements(interfaces.IAuthenticator)
     zope.interface.classProvides(interfaces.IPluginFactory)
 
-    description = "Standalone Authenticator"
+    description = "Automatically use a temporary webserver"
 
     def __init__(self, *args, **kwargs):
         super(Authenticator, self).__init__(*args, **kwargs)
 
-        # one self-signed key for all DVSNI and SimpleHTTP certificates
+        # one self-signed key for all tls-sni-01 certificates
         self.key = OpenSSL.crypto.PKey()
         self.key.generate_key(OpenSSL.crypto.TYPE_RSA, bits=2048)
-        # TODO: generate only when the first SimpleHTTP challenge is solved
-        self.simple_http_cert = acme_crypto_util.gen_ss_cert(
-            self.key, domains=["temp server"])
 
         self.served = collections.defaultdict(set)
 
@@ -163,9 +160,9 @@ class Authenticator(common.Plugin):
         # GIL, the operations are safe, c.f.
         # https://docs.python.org/2/faq/library.html#what-kinds-of-global-value-mutation-are-thread-safe
         self.certs = {}
-        self.simple_http_resources = set()
+        self.http_01_resources = set()
 
-        self.servers = ServerManager(self.certs, self.simple_http_resources)
+        self.servers = ServerManager(self.certs, self.http_01_resources)
 
     @classmethod
     def add_parser_arguments(cls, add):
@@ -180,8 +177,21 @@ class Authenticator(common.Plugin):
         return set(challenges.Challenge.TYPES[name] for name in
                    self.conf("supported-challenges").split(","))
 
+    @property
+    def _necessary_ports(self):
+        necessary_ports = set()
+        if challenges.HTTP01 in self.supported_challenges:
+            necessary_ports.add(self.config.http01_port)
+        if challenges.TLSSNI01 in self.supported_challenges:
+            necessary_ports.add(self.config.tls_sni_01_port)
+        return necessary_ports
+
     def more_info(self):  # pylint: disable=missing-docstring
-        return self.__doc__
+        return("This authenticator creates its own ephemeral TCP listener "
+               "on the necessary port in order to respond to incoming "
+               "tls-sni-01 and http-01 challenges from the certificate "
+               "authority. Therefore, it does not rely on any existing "
+               "server program.")
 
     def prepare(self):  # pylint: disable=missing-docstring
         pass
@@ -193,8 +203,7 @@ class Authenticator(common.Plugin):
         return chall_pref
 
     def perform(self, achalls):  # pylint: disable=missing-docstring
-        if any(util.already_listening(port) for port in
-               (self.config.dvsni_port, self.config.simple_http_port)):
+        if any(util.already_listening(port) for port in self._necessary_ports):
             raise errors.MisconfigurationError(
                 "At least one of the (possibly) required ports is "
                 "already taken.")
@@ -224,22 +233,20 @@ class Authenticator(common.Plugin):
         responses = []
 
         for achall in achalls:
-            if isinstance(achall, achallenges.SimpleHTTP):
+            if isinstance(achall.chall, challenges.HTTP01):
                 server = self.servers.run(
-                    self.config.simple_http_port, challenges.SimpleHTTP)
-                response, validation = achall.gen_response_and_validation(
-                    tls=False)
-                self.simple_http_resources.add(
-                    acme_standalone.SimpleHTTPRequestHandler.SimpleHTTPResource(
+                    self.config.http01_port, challenges.HTTP01)
+                response, validation = achall.response_and_validation()
+                self.http_01_resources.add(
+                    acme_standalone.HTTP01RequestHandler.HTTP01Resource(
                         chall=achall.chall, response=response,
                         validation=validation))
-                cert = self.simple_http_cert
-                domain = achall.domain
-            else:  # DVSNI
-                server = self.servers.run(self.config.dvsni_port, challenges.DVSNI)
-                response, cert, _ = achall.gen_cert_and_response(self.key)
-                domain = response.z_domain
-            self.certs[domain] = (self.key, cert)
+            else:  # tls-sni-01
+                server = self.servers.run(
+                    self.config.tls_sni_01_port, challenges.TLSSNI01)
+                response, (cert, _) = achall.response_and_validation(
+                    cert_key=self.key)
+                self.certs[response.z_domain] = (self.key, cert)
             self.served[server].add(achall)
             responses.append(response)
 

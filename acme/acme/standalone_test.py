@@ -1,7 +1,6 @@
 """Tests for acme.standalone."""
 import os
 import shutil
-import socket
 import threading
 import tempfile
 import time
@@ -29,48 +28,8 @@ class TLSServerTest(unittest.TestCase):
         server.server_close()  # pylint: disable=no-member
 
 
-class ACMEServerMixinTest(unittest.TestCase):
-    """Tests for acme.standalone.ACMEServerMixin."""
-
-    def setUp(self):
-        from acme.standalone import ACMEServerMixin
-
-        class _MockServer(socketserver.TCPServer, ACMEServerMixin):
-            def __init__(self, *args, **kwargs):
-                socketserver.TCPServer.__init__(self, *args, **kwargs)
-                ACMEServerMixin.__init__(self)
-        self.server = _MockServer(("", 0), socketserver.BaseRequestHandler)
-
-    def _busy_wait(self):  # pragma: no cover
-        # This function is used to avoid race coditions in tests, but
-        # not all of the functionality is always used, hence "no
-        # cover"
-        while True:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                # pylint: disable=no-member
-                sock.connect(self.server.socket.getsockname())
-            except socket.error:
-                pass
-            else:
-                break
-            finally:
-                sock.close()
-            time.sleep(1)
-
-    def test_serve_shutdown(self):
-        thread = threading.Thread(target=self.server.serve_forever2)
-        thread.start()
-        self._busy_wait()
-        self.server.shutdown2()
-
-    def test_shutdown2_not_running(self):
-        self.server.shutdown2()
-        self.server.shutdown2()
-
-
-class DVSNIServerTest(unittest.TestCase):
-    """Test for acme.standalone.DVSNIServer."""
+class TLSSNI01ServerTest(unittest.TestCase):
+    """Test for acme.standalone.TLSSNI01Server."""
 
     def setUp(self):
         self.certs = {
@@ -78,45 +37,41 @@ class DVSNIServerTest(unittest.TestCase):
                            # pylint: disable=protected-access
                            test_util.load_cert('cert.pem')._wrapped),
         }
-        from acme.standalone import DVSNIServer
-        self.server = DVSNIServer(("", 0), certs=self.certs)
+        from acme.standalone import TLSSNI01Server
+        self.server = TLSSNI01Server(("", 0), certs=self.certs)
         # pylint: disable=no-member
-        self.thread = threading.Thread(target=self.server.handle_request)
+        self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()
 
     def tearDown(self):
-        self.server.shutdown2()
+        self.server.shutdown()  # pylint: disable=no-member
         self.thread.join()
 
-    def test_init(self):
-        # pylint: disable=protected-access
-        self.assertFalse(self.server._stopped)
-
-    def test_dvsni(self):
-        cert = crypto_util.probe_sni(
-            b'localhost', *self.server.socket.getsockname())
+    def test_it(self):
+        host, port = self.server.socket.getsockname()[:2]
+        cert = crypto_util.probe_sni(b'localhost', host=host, port=port, timeout=1)
         self.assertEqual(jose.ComparableX509(cert),
                          jose.ComparableX509(self.certs[b'localhost'][1]))
 
 
-class SimpleHTTPServerTest(unittest.TestCase):
-    """Tests for acme.standalone.SimpleHTTPServer."""
+class HTTP01ServerTest(unittest.TestCase):
+    """Tests for acme.standalone.HTTP01Server."""
 
     def setUp(self):
         self.account_key = jose.JWK.load(
             test_util.load_vector('rsa1024_key.pem'))
         self.resources = set()
 
-        from acme.standalone import SimpleHTTPServer
-        self.server = SimpleHTTPServer(('', 0), resources=self.resources)
+        from acme.standalone import HTTP01Server
+        self.server = HTTP01Server(('', 0), resources=self.resources)
 
         # pylint: disable=no-member
         self.port = self.server.socket.getsockname()[1]
-        self.thread = threading.Thread(target=self.server.handle_request)
+        self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()
 
     def tearDown(self):
-        self.server.shutdown2()
+        self.server.shutdown()  # pylint: disable=no-member
         self.thread.join()
 
     def test_index(self):
@@ -131,29 +86,28 @@ class SimpleHTTPServerTest(unittest.TestCase):
             'http://localhost:{0}/foo'.format(self.port), verify=False)
         self.assertEqual(response.status_code, http_client.NOT_FOUND)
 
-    def _test_simple_http(self, add):
-        chall = challenges.SimpleHTTP(token=(b'x' * 16))
-        response = challenges.SimpleHTTPResponse(tls=False)
+    def _test_http01(self, add):
+        chall = challenges.HTTP01(token=(b'x' * 16))
+        response, validation = chall.response_and_validation(self.account_key)
 
-        from acme.standalone import SimpleHTTPRequestHandler
-        resource = SimpleHTTPRequestHandler.SimpleHTTPResource(
-            chall=chall, response=response, validation=response.gen_validation(
-                chall, self.account_key))
+        from acme.standalone import HTTP01RequestHandler
+        resource = HTTP01RequestHandler.HTTP01Resource(
+            chall=chall, response=response, validation=validation)
         if add:
             self.resources.add(resource)
         return resource.response.simple_verify(
             resource.chall, 'localhost', self.account_key.public_key(),
             port=self.port)
 
-    def test_simple_http_found(self):
-        self.assertTrue(self._test_simple_http(add=True))
+    def test_http01_found(self):
+        self.assertTrue(self._test_http01(add=True))
 
-    def test_simple_http_not_found(self):
-        self.assertFalse(self._test_simple_http(add=False))
+    def test_http01_not_found(self):
+        self.assertFalse(self._test_http01(add=False))
 
 
-class TestSimpleDVSNIServer(unittest.TestCase):
-    """Tests for acme.standalone.simple_dvsni_server."""
+class TestSimpleTLSSNI01Server(unittest.TestCase):
+    """Tests for acme.standalone.simple_tls_sni_01_server."""
 
     def setUp(self):
         # mirror ../examples/standalone
@@ -164,12 +118,14 @@ class TestSimpleDVSNIServer(unittest.TestCase):
         shutil.copy(test_util.vector_path('rsa512_key.pem'),
                     os.path.join(localhost_dir, 'key.pem'))
 
-        from acme.standalone import simple_dvsni_server
+        from acme.standalone import simple_tls_sni_01_server
         self.port = 1234
-        self.thread = threading.Thread(target=simple_dvsni_server, kwargs={
-            'cli_args': ('xxx', '--port', str(self.port)),
-            'forever': False,
-        })
+        self.thread = threading.Thread(
+            target=simple_tls_sni_01_server, kwargs={
+                'cli_args': ('xxx', '--port', str(self.port)),
+                'forever': False,
+            },
+        )
         self.old_cwd = os.getcwd()
         os.chdir(self.test_cwd)
         self.thread.start()
