@@ -2,11 +2,12 @@ language: python
 
 services:
   - rabbitmq
+  - mariadb
 
 # http://docs.travis-ci.com/user/ci-environment/#CI-environment-OS
 # gimme has to be kept in sync with Boulder's Go version setting in .travis.yml
 before_install:
-  - sudo apt-get install -y mariadb-server mariadb-server-10.0
+  - 'dpkg -s libaugeas0'
   - '[ "xxx$BOULDER_INTEGRATION" = "xxx" ] || eval "$(gimme 1.5.1)"'
 
 # using separate envs with different TOXENVs creates 4x1 Travis build
@@ -31,9 +32,8 @@ branches:
     - master
     - /^test-.*$/
 
-# enable Trusty beta on travis 
-sudo: required
-dist: trusty
+# container-based infrastructure
+sudo: false
 
 addons:
   # make sure simplehttp simple verification works (custom /etc/hosts)
@@ -41,6 +41,8 @@ addons:
     - le.wtf
   mariadb: "10.0"
   apt:
+    sources:
+    - augeas
     packages:  # keep in sync with bootstrap/ubuntu.sh and Boulder
     - python
     - python-dev
@@ -58,8 +60,7 @@ addons:
     - rsyslog
 
 install: "travis_retry pip install tox coveralls"
-before_script: '[ "xxx$BOULDER_INTEGRATION" = "xxx" ] || ./tests/boulder-start.sh'
-script: 'travis_retry tox && ([ "xxx$BOULDER_INTEGRATION" = "xxx" ] || (source .tox/$TOXENV/bin/activate && ./tests/boulder-integration.sh))'
+script: 'travis_retry tox && ([ "xxx$BOULDER_INTEGRATION" = "xxx" ] || ./tests/travis-integration.sh)'
 
 after_success: '[ "$TOXENV" == "cover" ] && coveralls'
 

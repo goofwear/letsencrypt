@@ -20,11 +20,20 @@ KEY = test_util.load_vector("rsa512_key.pem")
 CSR_SAN = test_util.load_vector("csr-san.der")
 
 
+class ConfigHelper(object):
+    """Creates a dummy object to imitate a namespace object
+
+        Example: cfg = ConfigHelper(redirect=True, hsts=False, uir=False)
+        will result in: cfg.redirect=True, cfg.hsts=False, etc.
+    """
+    def __init__(self, **kwds):
+        self.__dict__.update(kwds)
+
 class RegisterTest(unittest.TestCase):
     """Tests for letsencrypt.client.register."""
 
     def setUp(self):
-        self.config = mock.MagicMock(rsa_key_size=1024)
+        self.config = mock.MagicMock(rsa_key_size=1024, register_unsafely_without_email=False)
         self.account_storage = account.AccountMemoryStorage()
         self.tos_cb = mock.MagicMock()
 
@@ -47,10 +56,23 @@ class RegisterTest(unittest.TestCase):
 
     def test_it(self):
         with mock.patch("letsencrypt.client.acme_client.Client"):
-            with mock.patch("letsencrypt.account."
-                            "report_new_account"):
+            with mock.patch("letsencrypt.account.report_new_account"):
                 self._call()
 
+    @mock.patch("letsencrypt.account.report_new_account")
+    @mock.patch("letsencrypt.client.display_ops.get_email")
+    def test_email_retry(self, _rep, mock_get_email):
+        from acme import messages
+        msg = "Validation of contact mailto:sousaphone@improbablylongggstring.tld failed"
+        mx_err = messages.Error(detail=msg, typ="malformed", title="title")
+        with mock.patch("letsencrypt.client.acme_client.Client") as mock_client:
+            mock_client().register.side_effect = [mx_err, mock.MagicMock()]
+            self._call()
+            self.assertEqual(mock_get_email.call_count, 1)
+
+    def test_needs_email(self):
+        self.config.email = None
+        self.assertRaises(errors.Error, self._call)
 
 class ClientTest(unittest.TestCase):
     """Tests for letsencrypt.client.Client."""
@@ -70,8 +92,8 @@ class ClientTest(unittest.TestCase):
                 dv_auth=None, installer=None)
 
     def test_init_acme_verify_ssl(self):
-        self.acme_client.assert_called_once_with(
-            directory=mock.ANY, key=mock.ANY, verify_ssl=True)
+        net = self.acme_client.call_args[1]["net"]
+        self.assertTrue(net.verify_ssl)
 
     def _mock_obtain_certificate(self):
         self.client.auth_handler = mock.MagicMock()
@@ -148,7 +170,7 @@ class ClientTest(unittest.TestCase):
 
         shutil.rmtree(tmp_path)
 
-    def test_deploy_certificate(self):
+    def test_deploy_certificate_success(self):
         self.assertRaises(errors.Error, self.client.deploy_certificate,
                           ["foo.bar"], "key", "cert", "chain", "fullchain")
 
@@ -166,17 +188,38 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(installer.save.call_count, 2)
         installer.restart.assert_called_once_with()
 
-    def test_deploy_certificate_restart_failure_with_recovery(self):
+    def test_deploy_certificate_failure(self):
+        installer = mock.MagicMock()
+        self.client.installer = installer
+
+        installer.deploy_cert.side_effect = errors.PluginError
+        self.assertRaises(errors.PluginError, self.client.deploy_certificate,
+                          ["foo.bar"], "key", "cert", "chain", "fullchain")
+        installer.recovery_routine.assert_called_once_with()
+
+    def test_deploy_certificate_save_failure(self):
+        installer = mock.MagicMock()
+        self.client.installer = installer
+
+        installer.save.side_effect = errors.PluginError
+        self.assertRaises(errors.PluginError, self.client.deploy_certificate,
+                          ["foo.bar"], "key", "cert", "chain", "fullchain")
+        installer.recovery_routine.assert_called_once_with()
+
+    @mock.patch("letsencrypt.client.zope.component.getUtility")
+    def test_deploy_certificate_restart_failure(self, mock_get_utility):
         installer = mock.MagicMock()
         installer.restart.side_effect = [errors.PluginError, None]
         self.client.installer = installer
 
         self.assertRaises(errors.PluginError, self.client.deploy_certificate,
                           ["foo.bar"], "key", "cert", "chain", "fullchain")
+        self.assertEqual(mock_get_utility().add_message.call_count, 1)
         installer.rollback_checkpoints.assert_called_once_with()
         self.assertEqual(installer.restart.call_count, 2)
 
-    def test_deploy_certificate_restart_failure_without_recovery(self):
+    @mock.patch("letsencrypt.client.zope.component.getUtility")
+    def test_deploy_certificate_restart_failure2(self, mock_get_utility):
         installer = mock.MagicMock()
         installer.restart.side_effect = errors.PluginError
         installer.rollback_checkpoints.side_effect = errors.ReverterError
@@ -184,27 +227,141 @@ class ClientTest(unittest.TestCase):
 
         self.assertRaises(errors.PluginError, self.client.deploy_certificate,
                           ["foo.bar"], "key", "cert", "chain", "fullchain")
+        self.assertEqual(mock_get_utility().add_message.call_count, 1)
         installer.rollback_checkpoints.assert_called_once_with()
         self.assertEqual(installer.restart.call_count, 1)
 
     @mock.patch("letsencrypt.client.enhancements")
     def test_enhance_config(self, mock_enhancements):
+        config = ConfigHelper(redirect=True, hsts=False, uir=False)
         self.assertRaises(errors.Error,
-                          self.client.enhance_config, ["foo.bar"])
+                          self.client.enhance_config, ["foo.bar"], config)
 
         mock_enhancements.ask.return_value = True
         installer = mock.MagicMock()
         self.client.installer = installer
+        installer.supported_enhancements.return_value = ["redirect"]
 
-        self.client.enhance_config(["foo.bar"])
-        installer.enhance.assert_called_once_with("foo.bar", "redirect")
+        self.client.enhance_config(["foo.bar"], config)
+        installer.enhance.assert_called_once_with("foo.bar", "redirect", None)
         self.assertEqual(installer.save.call_count, 1)
         installer.restart.assert_called_once_with()
 
+    @mock.patch("letsencrypt.client.enhancements")
+    def test_enhance_config_no_ask(self, mock_enhancements):
+        config = ConfigHelper(redirect=True, hsts=False, uir=False)
+        self.assertRaises(errors.Error,
+                          self.client.enhance_config, ["foo.bar"], config)
+
+        mock_enhancements.ask.return_value = True
+        installer = mock.MagicMock()
+        self.client.installer = installer
+        installer.supported_enhancements.return_value = ["redirect", "ensure-http-header"]
+
+        config = ConfigHelper(redirect=True, hsts=False, uir=False)
+        self.client.enhance_config(["foo.bar"], config)
+        installer.enhance.assert_called_with("foo.bar", "redirect", None)
+
+        config = ConfigHelper(redirect=False, hsts=True, uir=False)
+        self.client.enhance_config(["foo.bar"], config)
+        installer.enhance.assert_called_with("foo.bar", "ensure-http-header",
+                "Strict-Transport-Security")
+
+        config = ConfigHelper(redirect=False, hsts=False, uir=True)
+        self.client.enhance_config(["foo.bar"], config)
+        installer.enhance.assert_called_with("foo.bar", "ensure-http-header",
+                "Upgrade-Insecure-Requests")
+
+        self.assertEqual(installer.save.call_count, 3)
+        self.assertEqual(installer.restart.call_count, 3)
+
+    @mock.patch("letsencrypt.client.enhancements")
+    def test_enhance_config_unsupported(self, mock_enhancements):
+        installer = mock.MagicMock()
+        self.client.installer = installer
+        installer.supported_enhancements.return_value = []
+
+        config = ConfigHelper(redirect=None, hsts=True, uir=True)
+        self.client.enhance_config(["foo.bar"], config)
+        installer.enhance.assert_not_called()
+        mock_enhancements.ask.assert_not_called()
+
+    def test_enhance_config_no_installer(self):
+        config = ConfigHelper(redirect=True, hsts=False, uir=False)
+        self.assertRaises(errors.Error,
+                          self.client.enhance_config, ["foo.bar"], config)
+
+    @mock.patch("letsencrypt.client.zope.component.getUtility")
+    @mock.patch("letsencrypt.client.enhancements")
+    def test_enhance_config_enhance_failure(self, mock_enhancements,
+                                            mock_get_utility):
+        mock_enhancements.ask.return_value = True
+        installer = mock.MagicMock()
+        self.client.installer = installer
+        installer.supported_enhancements.return_value = ["redirect"]
         installer.enhance.side_effect = errors.PluginError
+
+        config = ConfigHelper(redirect=True, hsts=False, uir=False)
+
         self.assertRaises(errors.PluginError,
-                          self.client.enhance_config, ["foo.bar"], True)
+                          self.client.enhance_config, ["foo.bar"], config)
         installer.recovery_routine.assert_called_once_with()
+        self.assertEqual(mock_get_utility().add_message.call_count, 1)
+
+    @mock.patch("letsencrypt.client.zope.component.getUtility")
+    @mock.patch("letsencrypt.client.enhancements")
+    def test_enhance_config_save_failure(self, mock_enhancements,
+                                         mock_get_utility):
+        mock_enhancements.ask.return_value = True
+        installer = mock.MagicMock()
+        self.client.installer = installer
+        installer.supported_enhancements.return_value = ["redirect"]
+        installer.save.side_effect = errors.PluginError
+
+        config = ConfigHelper(redirect=True, hsts=False, uir=False)
+
+        self.assertRaises(errors.PluginError,
+                          self.client.enhance_config, ["foo.bar"], config)
+        installer.recovery_routine.assert_called_once_with()
+        self.assertEqual(mock_get_utility().add_message.call_count, 1)
+
+    @mock.patch("letsencrypt.client.zope.component.getUtility")
+    @mock.patch("letsencrypt.client.enhancements")
+    def test_enhance_config_restart_failure(self, mock_enhancements,
+                                            mock_get_utility):
+        mock_enhancements.ask.return_value = True
+        installer = mock.MagicMock()
+        self.client.installer = installer
+        installer.supported_enhancements.return_value = ["redirect"]
+        installer.restart.side_effect = [errors.PluginError, None]
+
+        config = ConfigHelper(redirect=True, hsts=False, uir=False)
+
+        self.assertRaises(errors.PluginError,
+                          self.client.enhance_config, ["foo.bar"], config)
+
+        self.assertEqual(mock_get_utility().add_message.call_count, 1)
+        installer.rollback_checkpoints.assert_called_once_with()
+        self.assertEqual(installer.restart.call_count, 2)
+
+    @mock.patch("letsencrypt.client.zope.component.getUtility")
+    @mock.patch("letsencrypt.client.enhancements")
+    def test_enhance_config_restart_failure2(self, mock_enhancements,
+                                             mock_get_utility):
+        mock_enhancements.ask.return_value = True
+        installer = mock.MagicMock()
+        self.client.installer = installer
+        installer.supported_enhancements.return_value = ["redirect"]
+        installer.restart.side_effect = errors.PluginError
+        installer.rollback_checkpoints.side_effect = errors.ReverterError
+
+        config = ConfigHelper(redirect=True, hsts=False, uir=False)
+
+        self.assertRaises(errors.PluginError,
+                          self.client.enhance_config, ["foo.bar"], config)
+        self.assertEqual(mock_get_utility().add_message.call_count, 1)
+        installer.rollback_checkpoints.assert_called_once_with()
+        self.assertEqual(installer.restart.call_count, 1)
 
 
 class RollbackTest(unittest.TestCase):

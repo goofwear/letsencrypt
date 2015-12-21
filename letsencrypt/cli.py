@@ -1,12 +1,16 @@
 """Let's Encrypt CLI."""
+from __future__ import print_function
+
 # TODO: Sanity check all input.  Be sure to avoid shell code etc...
+# pylint: disable=too-many-lines
+# (TODO: split this file into main.py and cli.py)
 import argparse
 import atexit
 import functools
+import json
 import logging
 import logging.handlers
 import os
-import pkg_resources
 import sys
 import time
 import traceback
@@ -17,7 +21,6 @@ import zope.component
 import zope.interface.exceptions
 import zope.interface.verify
 
-from acme import client as acme_client
 from acme import jose
 
 import letsencrypt
@@ -28,6 +31,7 @@ from letsencrypt import configuration
 from letsencrypt import constants
 from letsencrypt import client
 from letsencrypt import crypto_util
+from letsencrypt import errors
 from letsencrypt import interfaces
 from letsencrypt import le_util
 from letsencrypt import log
@@ -36,9 +40,7 @@ from letsencrypt import storage
 
 from letsencrypt.display import util as display_util
 from letsencrypt.display import ops as display_ops
-from letsencrypt.errors import Error, PluginSelectionError, CertStorageError
 from letsencrypt.plugins import disco as plugins_disco
-
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,7 @@ the cert. Major SUBCOMMANDS are:
   revoke               Revoke a previously obtained certificate
   rollback             Rollback server configuration changes made during install
   config_changes       Show changes made to server config during installation
+  plugins              Display information about installed plugins
 
 """
 
@@ -71,8 +74,9 @@ USAGE = SHORT_USAGE + """Choice of server plugins for obtaining and installing c
   %s
   --standalone      Run a standalone webserver for authentication
   %s
+  --webroot         Place files in a server's webroot folder for authentication
 
-OR use different servers to obtain (authenticate) the cert and then install it:
+OR use different plugins to obtain (authenticate) the cert and then install it:
 
   --authenticator standalone --installer apache
 
@@ -82,7 +86,7 @@ More detailed help:
                         the available topics are:
 
    all, automation, paths, security, testing, or any of the subcommands or
-   plugins (certonly, install, nginx, apache, standalone, etc)
+   plugins (certonly, install, nginx, apache, standalone, webroot, etc)
 """
 
 
@@ -100,14 +104,14 @@ def usage_strings(plugins):
 
 
 def _find_domains(args, installer):
-    if args.domains is None:
+    if not args.domains:
         domains = display_ops.choose_names(installer)
     else:
         domains = args.domains
 
     if not domains:
-        raise Error("Please specify --domains, or --installer that "
-                    "will help in domain names autodiscovery")
+        raise errors.Error("Please specify --domains, or --installer that "
+                           "will help in domain names autodiscovery")
 
     return domains
 
@@ -141,10 +145,8 @@ def _determine_account(args, config):
         elif len(accounts) == 1:
             acc = accounts[0]
         else:  # no account registered yet
-            if args.email is None:
+            if args.email is None and not args.register_unsafely_without_email:
                 args.email = display_ops.get_email()
-            if not args.email:  # get_email might return ""
-                args.email = None
 
             def _tos_cb(regr):
                 if args.tos:
@@ -159,9 +161,9 @@ def _determine_account(args, config):
             try:
                 acc, acme = client.register(
                     config, account_storage, tos_cb=_tos_cb)
-            except Error as error:
+            except errors.Error as error:
                 logger.debug(error, exc_info=True)
-                raise Error(
+                raise errors.Error(
                     "Unable to register an account with ACME server")
 
     args.account = acc.id
@@ -195,7 +197,7 @@ def _find_duplicative_certs(config, domains):
         try:
             full_path = os.path.join(configs_dir, renewal_file)
             candidate_lineage = storage.RenewableCert(full_path, cli_config)
-        except (CertStorageError, IOError):
+        except (errors.CertStorageError, IOError):
             logger.warning("Renewal configuration file %s is broken. "
                            "Skipping.", full_path)
             continue
@@ -205,76 +207,131 @@ def _find_duplicative_certs(config, domains):
         if candidate_names == set(domains):
             identical_names_cert = candidate_lineage
         elif candidate_names.issubset(set(domains)):
-            subset_names_cert = candidate_lineage
+            # This logic finds and returns the largest subset-names cert
+            # in the case where there are several available.
+            if subset_names_cert is None:
+                subset_names_cert = candidate_lineage
+            elif len(candidate_names) > len(subset_names_cert.names()):
+                subset_names_cert = candidate_lineage
 
     return identical_names_cert, subset_names_cert
 
 
 def _treat_as_renewal(config, domains):
-    """Determine whether or not the call should be treated as a renewal.
+    """Determine whether there are duplicated names and how to handle them.
 
-    :returns: RenewableCert or None if renewal shouldn't occur.
-    :rtype: :class:`.storage.RenewableCert`
+    :returns: Two-element tuple containing desired new-certificate behavior as
+              a string token ("reinstall", "renew", or "newcert"), plus either
+              a RenewableCert instance or None if renewal shouldn't occur.
 
     :raises .Error: If the user would like to rerun the client again.
 
     """
-    renewal = False
-
     # Considering the possibility that the requested certificate is
     # related to an existing certificate.  (config.duplicate, which
     # is set with --duplicate, skips all of this logic and forces any
     # kind of certificate to be obtained with renewal = False.)
-    if not config.duplicate:
-        ident_names_cert, subset_names_cert = _find_duplicative_certs(
-            config, domains)
-        # I am not sure whether that correctly reads the systemwide
-        # configuration file.
-        question = None
-        if ident_names_cert is not None:
-            question = (
-                "You have an existing certificate that contains exactly the "
-                "same domains you requested (ref: {0}){br}{br}Do you want to "
-                "renew and replace this certificate with a newly-issued one?"
-            ).format(ident_names_cert.configfile.filename, br=os.linesep)
-        elif subset_names_cert is not None:
-            question = (
-                "You have an existing certificate that contains a portion of "
-                "the domains you requested (ref: {0}){br}{br}It contains these "
-                "names: {1}{br}{br}You requested these names for the new "
-                "certificate: {2}.{br}{br}Do you want to replace this existing "
-                "certificate with the new certificate?"
-            ).format(subset_names_cert.configfile.filename,
-                     ", ".join(subset_names_cert.names()),
-                     ", ".join(domains),
-                     br=os.linesep)
-        if question is None:
-            # We aren't in a duplicative-names situation at all, so we don't
-            # have to tell or ask the user anything about this.
-            pass
-        elif config.renew_by_default or zope.component.getUtility(
-                interfaces.IDisplay).yesno(question, "Replace", "Cancel"):
-            renewal = True
-        else:
-            reporter_util = zope.component.getUtility(interfaces.IReporter)
-            reporter_util.add_message(
-                "To obtain a new certificate that {0} an existing certificate "
-                "in its domain-name coverage, you must use the --duplicate "
-                "option.{br}{br}For example:{br}{br}{1} --duplicate {2}".format(
-                    "duplicates" if ident_names_cert is not None else
-                    "overlaps with",
-                    sys.argv[0], " ".join(sys.argv[1:]),
-                    br=os.linesep
-                ),
-                reporter_util.HIGH_PRIORITY)
-            raise Error(
-                "User did not use proper CLI and would like "
-                "to reinvoke the client.")
+    if config.duplicate:
+        return "newcert", None
+    # TODO: Also address superset case
+    ident_names_cert, subset_names_cert = _find_duplicative_certs(config, domains)
+    # XXX ^ schoen is not sure whether that correctly reads the systemwide
+    # configuration file.
+    if ident_names_cert is None and subset_names_cert is None:
+        return "newcert", None
 
-        if renewal:
-            return ident_names_cert if ident_names_cert is not None else subset_names_cert
+    if ident_names_cert is not None:
+        return _handle_identical_cert_request(config, ident_names_cert)
+    elif subset_names_cert is not None:
+        return _handle_subset_cert_request(config, domains, subset_names_cert)
 
-    return None
+def _handle_identical_cert_request(config, cert):
+    """Figure out what to do if a cert has the same names as a perviously obtained one
+
+    :param storage.RenewableCert cert:
+
+    :returns: Tuple of (string, cert_or_None) as per _treat_as_renewal
+    :rtype: tuple
+
+    """
+    if config.renew_by_default:
+        logger.info("Auto-renewal forced with --renew-by-default...")
+        return "renew", cert
+    if cert.should_autorenew(interactive=True):
+        logger.info("Cert is due for renewal, auto-renewing...")
+        return "renew", cert
+    if config.reinstall:
+        # Set with --reinstall, force an identical certificate to be
+        # reinstalled without further prompting.
+        return "reinstall", cert
+
+    question = (
+        "You have an existing certificate that contains exactly the same "
+        "domains you requested and isn't close to expiry."
+        "{br}(ref: {0}){br}{br}What would you like to do?"
+    ).format(cert.configfile.filename, br=os.linesep)
+
+    if config.verb == "run":
+        keep_opt = "Attempt to reinstall this existing certificate"
+    elif config.verb == "certonly":
+        keep_opt = "Keep the existing certificate for now"
+    choices = [keep_opt,
+               "Renew & replace the cert (limit ~5 per 7 days)",
+               "Cancel this operation and do nothing"]
+
+    display = zope.component.getUtility(interfaces.IDisplay)
+    response = display.menu(question, choices, "OK", "Cancel")
+    if response[0] == "cancel" or response[1] == 2:
+        # TODO: Add notification related to command-line options for
+        #       skipping the menu for this case.
+        raise errors.Error(
+            "User chose to cancel the operation and may "
+            "reinvoke the client.")
+    elif response[1] == 0:
+        return "reinstall", cert
+    elif response[1] == 1:
+        return "renew", cert
+    else:
+        assert False, "This is impossible"
+
+def _handle_subset_cert_request(config, domains, cert):
+    """Figure out what to do if a previous cert had a subset of the names now requested
+
+    :param storage.RenewableCert cert:
+
+    :returns: Tuple of (string, cert_or_None) as per _treat_as_renewal
+    :rtype: tuple
+
+    """
+    existing = ", ".join(cert.names())
+    question = (
+        "You have an existing certificate that contains a portion of "
+        "the domains you requested (ref: {0}){br}{br}It contains these "
+        "names: {1}{br}{br}You requested these names for the new "
+        "certificate: {2}.{br}{br}Do you want to expand and replace this existing "
+        "certificate with the new certificate?"
+    ).format(cert.configfile.filename,
+             existing,
+             ", ".join(domains),
+             br=os.linesep)
+    if config.expand or config.renew_by_default or zope.component.getUtility(
+            interfaces.IDisplay).yesno(question, "Expand", "Cancel"):
+        return "renew", cert
+    else:
+        reporter_util = zope.component.getUtility(interfaces.IReporter)
+        reporter_util.add_message(
+            "To obtain a new certificate that contains these names without "
+            "replacing your existing certificate for {0}, you must use the "
+            "--duplicate option.{br}{br}"
+            "For example:{br}{br}{1} --duplicate {2}".format(
+                existing,
+                sys.argv[0], " ".join(sys.argv[1:]),
+                br=os.linesep
+            ),
+            reporter_util.HIGH_PRIORITY)
+        raise errors.Error(
+            "User chose to cancel the operation and may "
+            "reinvoke the client.")
 
 
 def _report_new_cert(cert_path, fullchain_path):
@@ -303,13 +360,32 @@ def _report_new_cert(cert_path, fullchain_path):
            .format(and_chain, path, expiry))
     reporter_util.add_message(msg, reporter_util.MEDIUM_PRIORITY)
 
+def _suggest_donate():
+    "Suggest a donation to support Let's Encrypt"
+    reporter_util = zope.component.getUtility(interfaces.IReporter)
+    msg = ("If you like Let's Encrypt, please consider supporting our work by:\n\n"
+           "Donating to ISRG / Let's Encrypt:   https://letsencrypt.org/donate\n"
+           "Donating to EFF:                    https://eff.org/donate-le\n\n")
+    reporter_util.add_message(msg, reporter_util.LOW_PRIORITY)
 
-def _auth_from_domains(le_client, config, domains, plugins):
+
+def _auth_from_domains(le_client, config, domains):
     """Authenticate and enroll certificate."""
-    # Note: This can raise errors... caught above us though.
-    lineage = _treat_as_renewal(config, domains)
+    # Note: This can raise errors... caught above us though. This is now
+    # a three-way case: reinstall (which results in a no-op here because
+    # although there is a relevant lineage, we don't do anything to it
+    # inside this function -- we don't obtain a new certificate), renew
+    # (which results in treating the request as a renewal), or newcert
+    # (which results in treating the request as a new certificate request).
 
-    if lineage is not None:
+    action, lineage = _treat_as_renewal(config, domains)
+    if action == "reinstall":
+        # The lineage already exists; allow the caller to try installing
+        # it without getting a new certificate at all.
+        return lineage
+    elif action == "renew":
+        original_server = lineage.configuration["renewalparams"]["server"]
+        _avoid_invalidating_lineage(config, lineage, original_server)
         # TODO: schoen wishes to reuse key - discussion
         # https://github.com/letsencrypt/letsencrypt/pull/777/files#r40498574
         new_certr, new_chain, new_key, _ = le_client.obtain_certificate(domains)
@@ -323,16 +399,37 @@ def _auth_from_domains(le_client, config, domains, plugins):
         # TODO: Check return value of save_successor
         # TODO: Also update lineage renewal config with any relevant
         #       configuration values from this attempt? <- Absolutely (jdkasten)
-    else:
+    elif action == "newcert":
         # TREAT AS NEW REQUEST
-        lineage = le_client.obtain_and_enroll_certificate(domains, plugins)
+        lineage = le_client.obtain_and_enroll_certificate(domains)
         if not lineage:
-            raise Error("Certificate could not be obtained")
+            raise errors.Error("Certificate could not be obtained")
 
     _report_new_cert(lineage.cert, lineage.fullchain)
 
     return lineage
 
+def _avoid_invalidating_lineage(config, lineage, original_server):
+    "Do not renew a valid cert with one from a staging server!"
+    def _is_staging(srv):
+        return srv == constants.STAGING_URI or "staging" in srv
+
+    # Some lineages may have begun with --staging, but then had production certs
+    # added to them
+    latest_cert = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM,
+                                                  open(lineage.cert).read())
+    # all our test certs are from happy hacker fake CA, though maybe one day
+    # we should test more methodically
+    now_valid = not "fake" in repr(latest_cert.get_issuer()).lower()
+
+    if _is_staging(config.server):
+        if not _is_staging(original_server) or now_valid:
+            if not config.break_my_certs:
+                names = ", ".join(lineage.names())
+                raise errors.Error(
+                    "You've asked to renew/replace a seemingly valid certificate with "
+                    "a test certificate (domains: {0}). We will not do that "
+                    "unless you use the --break-my-certs flag!".format(names))
 
 def set_configurator(previously, now):
     """
@@ -346,7 +443,7 @@ def set_configurator(previously, now):
     if previously:
         if previously != now:
             msg = "Too many flags setting configurators/installers/authenticators {0} -> {1}"
-            raise PluginSelectionError(msg.format(repr(previously), repr(now)))
+            raise errors.PluginSelectionError(msg.format(repr(previously), repr(now)))
     return now
 
 
@@ -379,13 +476,12 @@ def diagnose_configurator_problem(cfg_type, requested, plugins):
                    '"letsencrypt-auto certonly" to get a cert you can install manually')
     else:
         msg = "{0} could not be determined or is not installed".format(cfg_type)
-    raise PluginSelectionError(msg)
+    raise errors.PluginSelectionError(msg)
 
 
-def choose_configurator_plugins(args, config, plugins, verb):
+def choose_configurator_plugins(args, config, plugins, verb):  # pylint: disable=too-many-branches
     """
     Figure out which configurator we're going to use
-
     :raises error.PluginSelectionError if there was a problem
     """
 
@@ -410,6 +506,10 @@ def choose_configurator_plugins(args, config, plugins, verb):
         req_auth = set_configurator(req_auth, "apache")
     if args.standalone:
         req_auth = set_configurator(req_auth, "standalone")
+    if args.webroot:
+        req_auth = set_configurator(req_auth, "webroot")
+    if args.manual:
+        req_auth = set_configurator(req_auth, "manual")
     logger.debug("Requested authenticator %s and installer %s", req_auth, req_inst)
 
     # Try to meet the user's request and/or ask them to pick plugins
@@ -425,12 +525,21 @@ def choose_configurator_plugins(args, config, plugins, verb):
             authenticator = display_ops.pick_authenticator(config, req_auth, plugins)
     logger.debug("Selected authenticator %s and installer %s", authenticator, installer)
 
+    # Report on any failures
     if need_inst and not installer:
         diagnose_configurator_problem("installer", req_inst, plugins)
     if need_auth and not authenticator:
         diagnose_configurator_problem("authenticator", req_auth, plugins)
 
+    record_chosen_plugins(config, plugins, authenticator, installer)
     return installer, authenticator
+
+
+def record_chosen_plugins(config, plugins, auth, inst):
+    "Update the config entries to reflect the plugins we actually selected."
+    cn = config.namespace
+    cn.authenticator = plugins.find_init(auth).name if auth else "none"
+    cn.installer = plugins.find_init(inst).name if inst else "none"
 
 
 # TODO: Make run as close to auth + install as possible
@@ -439,7 +548,7 @@ def run(args, config, plugins):  # pylint: disable=too-many-branches,too-many-lo
     """Obtain a certificate and install."""
     try:
         installer, authenticator = choose_configurator_plugins(args, config, plugins, "run")
-    except PluginSelectionError, e:
+    except errors.PluginSelectionError, e:
         return e.message
 
     domains = _find_domains(args, installer)
@@ -447,24 +556,25 @@ def run(args, config, plugins):  # pylint: disable=too-many-branches,too-many-lo
     # TODO: Handle errors from _init_le_client?
     le_client = _init_le_client(args, config, authenticator, installer)
 
-    lineage = _auth_from_domains(le_client, config, domains, plugins)
+    lineage = _auth_from_domains(le_client, config, domains)
 
     le_client.deploy_certificate(
         domains, lineage.privkey, lineage.cert,
         lineage.chain, lineage.fullchain)
 
-    le_client.enhance_config(domains, args.redirect)
+    le_client.enhance_config(domains, config)
 
     if len(lineage.available_versions("cert")) == 1:
         display_ops.success_installation(domains)
     else:
         display_ops.success_renewal(domains)
 
+    _suggest_donate()
 
-def obtaincert(args, config, plugins):
+
+def obtain_cert(args, config, plugins):
     """Authenticate & obtain cert, but do not install it."""
-
-    if args.domains is not None and args.csr is not None:
+    if args.domains and args.csr is not None:
         # TODO: --csr could have a priority, when --domains is
         # supplied, check if CSR matches given domains?
         return "--domains and --csr are mutually exclusive"
@@ -472,7 +582,7 @@ def obtaincert(args, config, plugins):
     try:
         # installers are used in auth mode to determine domain names
         installer, authenticator = choose_configurator_plugins(args, config, plugins, "certonly")
-    except PluginSelectionError, e:
+    except errors.PluginSelectionError, e:
         return e.message
 
     # TODO: Handle errors from _init_le_client?
@@ -487,7 +597,9 @@ def obtaincert(args, config, plugins):
         _report_new_cert(cert_path, cert_fullchain)
     else:
         domains = _find_domains(args, installer)
-        _auth_from_domains(le_client, config, domains, plugins)
+        _auth_from_domains(le_client, config, domains)
+
+    _suggest_donate()
 
 
 def install(args, config, plugins):
@@ -497,7 +609,7 @@ def install(args, config, plugins):
     try:
         installer, _ = choose_configurator_plugins(args, config,
                                                    plugins, "install")
-    except PluginSelectionError, e:
+    except errors.PluginSelectionError, e:
         return e.message
 
     domains = _find_domains(args, installer)
@@ -507,23 +619,24 @@ def install(args, config, plugins):
     le_client.deploy_certificate(
         domains, args.key_path, args.cert_path, args.chain_path,
         args.fullchain_path)
-    le_client.enhance_config(domains, args.redirect)
+    le_client.enhance_config(domains, config)
 
 
 def revoke(args, config, unused_plugins):  # TODO: coop with renewal config
     """Revoke a previously obtained certificate."""
+    # For user-agent construction
+    config.namespace.installer = config.namespace.authenticator = "none"
     if args.key_path is not None:  # revocation by cert key
         logger.debug("Revoking %s using cert key %s",
                      args.cert_path[0], args.key_path[0])
-        acme = acme_client.Client(
-            config.server, key=jose.JWK.load(args.key_path[1]))
+        key = jose.JWK.load(args.key_path[1])
     else:  # revocation by account key
         logger.debug("Revoking %s using Account Key", args.cert_path[0])
         acc, _ = _determine_account(args, config)
-        # pylint: disable=protected-access
-        acme = client._acme_from_config_key(config, acc.key)
-    acme.revoke(jose.ComparableX509(crypto_util.pyopenssl_load_certificate(
-        args.cert_path[1])[0]))
+        key = acc.key
+    acme = client.acme_from_config_key(config, key)
+    cert = crypto_util.pyopenssl_load_certificate(args.cert_path[1])[0]
+    acme.revoke(jose.ComparableX509(cert))
 
 
 def rollback(args, config, plugins):
@@ -549,6 +662,7 @@ def plugins_cmd(args, config, plugins):  # TODO: Use IDisplay rather than print
     logger.debug("Filtered plugins: %r", filtered)
 
     if not args.init and not args.prepare:
+        print(str(filtered))
         return
 
     filtered.init(config)
@@ -556,26 +670,29 @@ def plugins_cmd(args, config, plugins):  # TODO: Use IDisplay rather than print
     logger.debug("Verified plugins: %r", verified)
 
     if not args.prepare:
+        print(str(verified))
         return
 
     verified.prepare()
     available = verified.available()
     logger.debug("Prepared plugins: %s", available)
+    print(str(available))
 
 
 def read_file(filename, mode="rb"):
     """Returns the given file's contents.
 
-    :param str filename: Filename
+    :param str filename: path to file
     :param str mode: open mode (see `open`)
 
-    :returns: A tuple of filename and its contents
+    :returns: absolute path of filename and its contents
     :rtype: tuple
 
     :raises argparse.ArgumentTypeError: File does not exist or is not readable.
 
     """
     try:
+        filename = os.path.abspath(filename)
         return filename, open(filename, mode).read()
     except IOError as exc:
         raise argparse.ArgumentTypeError(exc.strerror)
@@ -621,7 +738,7 @@ class HelpfulArgumentParser(object):
     """
 
     # Maps verbs/subcommands to the functions that implement them
-    VERBS = {"auth": obtaincert, "certonly": obtaincert,
+    VERBS = {"auth": obtain_cert, "certonly": obtain_cert,
              "config_changes": config_changes, "everything": run,
              "install": install, "plugins": plugins_cmd,
              "revoke": revoke, "rollback": rollback, "run": run}
@@ -652,10 +769,9 @@ class HelpfulArgumentParser(object):
         self.help_arg = max(help1, help2)
         if self.help_arg is True:
             # just --help with no topic; avoid argparse altogether
-            print usage
+            print(usage)
             sys.exit(0)
         self.visible_topics = self.determine_help_topics(self.help_arg)
-        #print self.visible_topics
         self.groups = {}  # elements are added by .add_group()
 
     def parse_args(self):
@@ -667,8 +783,18 @@ class HelpfulArgumentParser(object):
         """
         parsed_args = self.parser.parse_args(self.args)
         parsed_args.func = self.VERBS[self.verb]
+        parsed_args.verb = self.verb
+
+        # Do any post-parsing homework here
+
+        # argparse seemingly isn't flexible enough to give us this behaviour easily...
+        if parsed_args.staging:
+            if parsed_args.server not in (flag_default("server"), constants.STAGING_URI):
+                raise errors.Error("--server value conflicts with --staging")
+            parsed_args.server = constants.STAGING_URI
 
         return parsed_args
+
 
     def determine_verb(self):
         """Determines the verb/subcommand provided by the user.
@@ -732,6 +858,20 @@ class HelpfulArgumentParser(object):
             kwargs["help"] = argparse.SUPPRESS
             self.parser.add_argument(*args, **kwargs)
 
+    def add_deprecated_argument(self, argument_name, num_args):
+        """Adds a deprecated argument with the name argument_name.
+
+        Deprecated arguments are not shown in the help. If they are used
+        on the command line, a warning is shown stating that the
+        argument is deprecated and no other action is taken.
+
+        :param str argument_name: Name of deprecated argument.
+        :param int nargs: Number of arguments the option takes.
+
+        """
+        le_util.add_deprecated_argument(
+            self.parser.add_argument, argument_name, num_args)
+
     def add_group(self, topic, **kwargs):
         """
 
@@ -742,12 +882,12 @@ class HelpfulArgumentParser(object):
 
         """
         if self.visible_topics[topic]:
-            #print "Adding visible group " + topic
+            #print("Adding visible group " + topic)
             group = self.parser.add_argument_group(topic, **kwargs)
             self.groups[topic] = group
             return group
         else:
-            #print "Invisible group " + topic
+            #print("Invisible group " + topic)
             return self.silent_parser
 
     def add_plugin_args(self, plugins):
@@ -759,7 +899,7 @@ class HelpfulArgumentParser(object):
         """
         for name, plugin_ep in plugins.iteritems():
             parser_or_group = self.add_group(name, description=plugin_ep.description)
-            #print parser_or_group
+            #print(parser_or_group)
             plugin_ep.plugin_cls.inject_parser_options(parser_or_group, name)
 
     def determine_help_topics(self, chosen_topic):
@@ -806,19 +946,39 @@ def prepare_and_parse_args(plugins, args):
     helpful.add(
         None, "-t", "--text", dest="text_mode", action="store_true",
         help="Use the text output instead of the curses UI.")
+    helpful.add(
+        None, "--register-unsafely-without-email", action="store_true",
+        help="Specifying this flag enables registering an account with no "
+             "email address. This is strongly discouraged, because in the "
+             "event of key loss or account compromise you will irrevocably "
+             "lose access to your account. You will also be unable to receive "
+             "notice about impending expiration or revocation of your "
+             "certificates. Updates to the Subscriber Agreement will still "
+             "affect you, and will be effective 14 days after posting an "
+             "update to the web site.")
     helpful.add(None, "-m", "--email", help=config_help("email"))
     # positional arg shadows --domains, instead of appending, and
     # --domains is useful, because it can be stored in config
     #for subparser in parser_run, parser_auth, parser_install:
     #    subparser.add_argument("domains", nargs="*", metavar="domain")
-    helpful.add(None, "-d", "--domains", metavar="DOMAIN", action="append")
-    helpful.add(
-        None, "--duplicate", dest="duplicate", action="store_true",
-        help="Allow getting a certificate that duplicates an existing one")
-
+    helpful.add(None, "-d", "--domains", "--domain", dest="domains",
+                metavar="DOMAIN", action=DomainFlagProcessor, default=[],
+                help="Domain names to apply. For multiple domains you can use "
+                "multiple -d flags or enter a comma separated list of domains "
+                "as a parameter.")
     helpful.add_group(
         "automation",
         description="Arguments for automating execution & other tweaks")
+    helpful.add(
+        "automation", "--keep-until-expiring", "--keep", "--reinstall",
+        dest="reinstall", action="store_true",
+        help="If the requested cert matches an existing cert, always keep the "
+             "existing one until it is due for renewal (for the "
+             "'run' subcommand this means reinstall the existing cert)")
+    helpful.add(
+        "automation", "--expand", action="store_true",
+        help="If an existing cert covers some subset of the requested names, "
+             "always expand and replace it with the additional names.")
     helpful.add(
         "automation", "--version", action="version",
         version="%(prog)s {0}".format(letsencrypt.__version__),
@@ -826,16 +986,18 @@ def prepare_and_parse_args(plugins, args):
     helpful.add(
         "automation", "--renew-by-default", action="store_true",
         help="Select renewal by default when domains are a superset of a "
-             "a previously attained cert")
-    helpful.add(
-        "automation", "--agree-dev-preview", action="store_true",
-        help="Agree to the Let's Encrypt Developer Preview Disclaimer")
+             "previously attained cert (often --keep-until-expiring is "
+             "more appropriate). Implies --expand.")
     helpful.add(
         "automation", "--agree-tos", dest="tos", action="store_true",
         help="Agree to the Let's Encrypt Subscriber Agreement")
     helpful.add(
         "automation", "--account", metavar="ACCOUNT_ID",
         help="Account ID to use")
+    helpful.add(
+        "automation", "--duplicate", dest="duplicate", action="store_true",
+        help="Allow making a certificate lineage that duplicates an existing one "
+             "(both can be renewed in parallel)")
 
     helpful.add_group(
         "testing", description="The following flags are meant for "
@@ -853,9 +1015,13 @@ def prepare_and_parse_args(plugins, args):
         "testing", "--tls-sni-01-port", type=int,
         default=flag_default("tls_sni_01_port"),
         help=config_help("tls_sni_01_port"))
-    helpful.add("testing", "--http-01-port", dest="http01_port", type=int,
-                help=config_help("http01_port"))
-
+    helpful.add(
+        "testing", "--http-01-port", type=int, dest="http01_port",
+        default=flag_default("http01_port"), help=config_help("http01_port"))
+    helpful.add(
+        "testing", "--break-my-certs", action="store_true",
+        help="Be willing to replace or renew valid certs with invalid "
+             "(testing/staging) certs")
     helpful.add_group(
         "security", description="Security parameters & server settings")
     helpful.add(
@@ -870,16 +1036,36 @@ def prepare_and_parse_args(plugins, args):
         help="Do not automatically redirect all HTTP traffic to HTTPS for the newly "
              "authenticated vhost.", dest="redirect", default=None)
     helpful.add(
+        "security", "--hsts", action="store_true",
+        help="Add the Strict-Transport-Security header to every HTTP response."
+             " Forcing browser to use always use SSL for the domain."
+             " Defends against SSL Stripping.", dest="hsts", default=False)
+    helpful.add(
+        "security", "--no-hsts", action="store_false",
+        help="Do not automatically add the Strict-Transport-Security header"
+             " to every HTTP response.", dest="hsts", default=False)
+    helpful.add(
+        "security", "--uir", action="store_true",
+        help="Add the \"Content-Security-Policy: upgrade-insecure-requests\""
+             " header to every HTTP response. Forcing the browser to use"
+             " https:// for every http:// resource.", dest="uir", default=None)
+    helpful.add(
+        "security", "--no-uir", action="store_false",
+        help=" Do not automatically set the \"Content-Security-Policy:"
+        " upgrade-insecure-requests\" header to every HTTP response.",
+        dest="uir", default=None)
+    helpful.add(
         "security", "--strict-permissions", action="store_true",
         help="Require that all configuration files are owned by the current "
              "user; only needed if your config is somewhere unsafe like /tmp/")
+
+    helpful.add_deprecated_argument("--agree-dev-preview", 0)
 
     _create_subparsers(helpful)
     _paths_parser(helpful)
     # _plugins_parsing should be the last thing to act upon the main
     # parser (--help should display plugin-specific options last)
     _plugins_parsing(helpful, plugins)
-
 
     return helpful.parse_args()
 
@@ -890,7 +1076,12 @@ def _create_subparsers(helpful):
     helpful.add_group("revoke", description="Options for revocation of certs")
     helpful.add_group("rollback", description="Options for reverting config changes")
     helpful.add_group("plugins", description="Plugin options")
-
+    helpful.add(
+        None, "--user-agent", default=None,
+        help="Set a custom user agent string for the client. User agent strings allow "
+             "the CA to collect high level statistics about success rates by OS and "
+             "plugin. If you wish to hide your server OS version from the Let's "
+             'Encrypt server, set this to "".')
     helpful.add("certonly",
                 "--csr", type=read_file,
                 help="Path to a Certificate Signing Request (CSR) in DER"
@@ -925,26 +1116,29 @@ def _paths_parser(helpful):
     if verb in ("install", "revoke", "certonly"):
         section = verb
     if verb == "certonly":
-        add(section, "--cert-path", default=flag_default("auth_cert_path"), help=cph)
+        add(section, "--cert-path", type=os.path.abspath,
+            default=flag_default("auth_cert_path"), help=cph)
     elif verb == "revoke":
         add(section, "--cert-path", type=read_file, required=True, help=cph)
     else:
-        add(section, "--cert-path", help=cph, required=(verb == "install"))
+        add(section, "--cert-path", type=os.path.abspath,
+            help=cph, required=(verb == "install"))
 
     section = "paths"
     if verb in ("install", "revoke"):
         section = verb
     # revoke --key-path reads a file, install --key-path takes a string
-    add(section, "--key-path", type=((verb == "revoke" and read_file) or str),
-        required=(verb == "install"),
-        help="Path to private key for cert creation or revocation (if account key is missing)")
+    add(section, "--key-path", required=(verb == "install"),
+        type=((verb == "revoke" and read_file) or os.path.abspath),
+        help="Path to private key for cert installation "
+             "or revocation (if account key is missing)")
 
     default_cp = None
     if verb == "certonly":
         default_cp = flag_default("auth_chain_path")
-    add("paths", "--fullchain-path", default=default_cp,
+    add("paths", "--fullchain-path", default=default_cp, type=os.path.abspath,
         help="Accompanying path to a full certificate chain (cert plus chain).")
-    add("paths", "--chain-path", default=default_cp,
+    add("paths", "--chain-path", default=default_cp, type=os.path.abspath,
         help="Accompanying path to a certificate chain.")
     add("paths", "--config-dir", default=flag_default("config_dir"),
         help=config_help("config_dir"))
@@ -954,13 +1148,17 @@ def _paths_parser(helpful):
         help="Logs directory.")
     add("paths", "--server", default=flag_default("server"),
         help=config_help("server"))
+    # overwrites server, handled in HelpfulArgumentParser.parse_args()
+    add("testing", "--test-cert", "--staging", action='store_true', dest='staging',
+        help='Use the staging server to obtain test (invalid) certs; equivalent'
+             ' to --server ' + constants.STAGING_URI)
 
 
 def _plugins_parsing(helpful, plugins):
     helpful.add_group(
         "plugins", description="Let's Encrypt client supports an "
         "extensible plugins architecture. See '%(prog)s plugins' for a "
-        "list of all available plugins and their names. You can force "
+        "list of all installed plugins and their names. You can force "
         "a particular plugin by setting options provided below. Further "
         "down this help message you will find plugin-specific options "
         "(prefixed by --{plugin_name}).")
@@ -978,12 +1176,71 @@ def _plugins_parsing(helpful, plugins):
                 help="Obtain and install certs using Nginx")
     helpful.add("plugins", "--standalone", action="store_true",
                 help='Obtain certs using a "standalone" webserver.')
+    helpful.add("plugins", "--manual", action="store_true",
+                help='Provide laborious manual instructions for obtaining a cert')
+    helpful.add("plugins", "--webroot", action="store_true",
+                help='Obtain certs by placing files in a webroot directory.')
 
     # things should not be reorder past/pre this comment:
     # plugins_group should be displayed in --help before plugin
     # specific groups (so that plugins_group.description makes sense)
 
     helpful.add_plugin_args(plugins)
+
+    # These would normally be a flag within the webroot plugin, but because
+    # they are parsed in conjunction with --domains, they live here for
+    # legibiility. helpful.add_plugin_ags must be called first to add the
+    # "webroot" topic
+    helpful.add("webroot", "-w", "--webroot-path", action=WebrootPathProcessor,
+                help="public_html / webroot path. This can be specified multiple times to "
+                     "handle different domains; each domain will have the webroot path that"
+                     " preceded it.  For instance: `-w /var/www/example -d example.com -d "
+                     "www.example.com -w /var/www/thing -d thing.net -d m.thing.net`")
+    parse_dict = lambda s: dict(json.loads(s))
+    # --webroot-map still has some awkward properties, so it is undocumented
+    helpful.add("webroot", "--webroot-map", default={}, type=parse_dict,
+                help=argparse.SUPPRESS)
+
+
+class WebrootPathProcessor(argparse.Action): # pylint: disable=missing-docstring
+    def __init__(self, *args, **kwargs):
+        self.domain_before_webroot = False
+        argparse.Action.__init__(self, *args, **kwargs)
+
+    def __call__(self, parser, config, webroot, option_string=None):
+        """
+        Keep a record of --webroot-path / -w flags during processing, so that
+        we know which apply to which -d flags
+        """
+        if config.webroot_path is None:      # first -w flag encountered
+            config.webroot_path = []
+            # if any --domain flags preceded the first --webroot-path flag,
+            # apply that webroot path to those; subsequent entries in
+            # config.webroot_map are filled in by cli.DomainFlagProcessor
+            if config.domains:
+                self.domain_before_webroot = True
+                for d in config.domains:
+                    config.webroot_map.setdefault(d, webroot)
+        elif self.domain_before_webroot:
+            # FIXME if you set domains in a config file, you should get a different error
+            # here, pointing you to --webroot-map
+            raise errors.Error("If you specify multiple webroot paths, one of "
+                               "them must precede all domain flags")
+        config.webroot_path.append(webroot)
+
+
+class DomainFlagProcessor(argparse.Action): # pylint: disable=missing-docstring
+    def __call__(self, parser, config, domain_arg, option_string=None):
+        """
+        Process a new -d flag, helping the webroot plugin construct a map of
+        {domain : webrootpath} if -w / --webroot-path is in use
+        """
+        for domain in (d.strip() for d in domain_arg.split(",")):
+            if domain not in config.domains:
+                config.domains.append(domain)
+                # Each domain has a webroot_path of the most recent -w flag
+                if config.webroot_path:
+                    config.webroot_map[domain] = config.webroot_path[-1]
 
 
 def setup_log_file_handler(args, logfile, fmt):
@@ -1060,14 +1317,22 @@ def _handle_exception(exc_type, exc_value, trace, args):
                 sys.exit("".join(
                     traceback.format_exception(exc_type, exc_value, trace)))
 
-        if issubclass(exc_type, Error):
+        if issubclass(exc_type, errors.Error):
             sys.exit(exc_value)
         else:
+            # Here we're passing a client or ACME error out to the client at the shell
             # Tell the user a bit about what happened, without overwhelming
             # them with a full traceback
-            msg = ("An unexpected error occurred.\n" +
-                   traceback.format_exception_only(exc_type, exc_value)[0] +
-                   "Please see the ")
+            err = traceback.format_exception_only(exc_type, exc_value)[0]
+            # Typical error from the ACME module:
+            # acme.messages.Error: urn:acme:error:malformed :: The request message was
+            # malformed :: Error creating new registration :: Validation of contact
+            # mailto:none@longrandomstring.biz failed: Server failure at resolver
+            if ("urn:acme" in err and ":: " in err
+                and args.verbose_count <= flag_default("verbose_count")):
+                # prune ACME error code, we have a human description
+                _code, _sep, err = err.partition(":: ")
+            msg = "An unexpected error occurred:\n" + err + "Please see the "
             if args is None:
                 msg += "logfile '{0}' for more details.".format(logfile)
             else:
@@ -1119,13 +1384,6 @@ def main(cli_args=sys.argv[1:]):
     zope.component.provideUtility(report)
     atexit.register(report.atexit_print_messages)
 
-    # TODO: remove developer preview prompt for the launch
-    if not config.agree_dev_preview:
-        disclaimer = pkg_resources.resource_string("letsencrypt", "DISCLAIMER")
-        if not zope.component.getUtility(interfaces.IDisplay).yesno(
-                disclaimer, "Agree", "Cancel"):
-            raise Error("Must agree to TOS")
-
     if not os.geteuid() == 0:
         logger.warning(
             "Root (sudo) is required to run most of letsencrypt functionality.")
@@ -1138,7 +1396,6 @@ def main(cli_args=sys.argv[1:]):
         #    .format(os.linesep))
 
     return args.func(args, config, plugins)
-
 
 if __name__ == "__main__":
     err_string = main()

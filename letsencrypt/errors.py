@@ -66,6 +66,10 @@ class PluginError(Error):
     """Let's Encrypt Plugin error."""
 
 
+class PluginEnhancementAlreadyPresent(Error):
+    """ Enhancement was already set """
+
+
 class PluginSelectionError(Error):
     """A problem with plugin/configurator selection or setup"""
 
@@ -94,3 +98,7 @@ class StandaloneBindError(Error):
             "Problem binding to port {0}: {1}".format(port, socket_error))
         self.socket_error = socket_error
         self.port = port
+
+
+class ConfigurationError(Error):
+    """Configuration sanity error."""

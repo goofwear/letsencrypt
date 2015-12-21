@@ -20,7 +20,9 @@ from acme import messages
 
 logger = logging.getLogger(__name__)
 
-# Python does not validate certificates by default before version 2.7.9
+# Prior to Python 2.7.9 the stdlib SSL module did not allow a user to configure
+# many important security related options. On these platforms we use PyOpenSSL
+# for SSL, which does allow these options to be configured.
 # https://urllib3.readthedocs.org/en/latest/security.html#insecureplatformwarning
 if sys.version_info < (2, 7, 9):  # pragma: no cover
     requests.packages.urllib3.contrib.pyopenssl.inject_into_urllib3()
@@ -246,9 +248,7 @@ class Client(object):  # pylint: disable=too-many-instance-attributes
     def retry_after(cls, response, default):
         """Compute next `poll` time based on response ``Retry-After`` header.
 
-        :param response: Response from `poll`.
-        :type response: `requests.Response`
-
+        :param requests.Response response: Response from `poll`.
         :param int default: Default value (in seconds), used when
             ``Retry-After`` header is not present or invalid.
 
@@ -323,30 +323,32 @@ class Client(object):  # pylint: disable=too-many-instance-attributes
             body=jose.ComparableX509(OpenSSL.crypto.load_certificate(
                 OpenSSL.crypto.FILETYPE_ASN1, response.content)))
 
-    def poll_and_request_issuance(self, csr, authzrs, mintime=5):
+    def poll_and_request_issuance(
+            self, csr, authzrs, mintime=5, max_attempts=10):
         """Poll and request issuance.
 
         This function polls all provided Authorization Resource URIs
         until all challenges are valid, respecting ``Retry-After`` HTTP
         headers, and then calls `request_issuance`.
 
-        .. todo:: add `max_attempts` or `timeout`
-
-        :param csr: CSR.
-        :type csr: `OpenSSL.crypto.X509Req` wrapped in `.ComparableX509`
-
+        :param .ComparableX509 csr: CSR (`OpenSSL.crypto.X509Req`
+            wrapped in `.ComparableX509`)
         :param authzrs: `list` of `.AuthorizationResource`
-
         :param int mintime: Minimum time before next attempt, used if
             ``Retry-After`` is not present in the response.
+        :param int max_attempts: Maximum number of attempts before
+            `PollError` with non-empty ``waiting`` is raised.
 
         :returns: ``(cert, updated_authzrs)`` `tuple` where ``cert`` is
-            the issued certificate (`.messages.CertificateResource.),
+            the issued certificate (`.messages.CertificateResource`),
             and ``updated_authzrs`` is a `tuple` consisting of updated
             Authorization Resources (`.AuthorizationResource`) as
             present in the responses from server, and in the same order
             as the input ``authzrs``.
         :rtype: `tuple`
+
+        :raises PollError: in case of timeout or if some authorization
+            was marked by the CA as invalid
 
         """
         # priority queue with datetime (based on Retry-After) as key,
@@ -356,7 +358,8 @@ class Client(object):  # pylint: disable=too-many-instance-attributes
         # recently updated one
         updated = dict((authzr, authzr) for authzr in authzrs)
 
-        while waiting:
+        while waiting and max_attempts:
+            max_attempts -= 1
             # find the smallest Retry-After, and sleep if necessary
             when, authzr = heapq.heappop(waiting)
             now = datetime.datetime.now()
@@ -371,10 +374,15 @@ class Client(object):  # pylint: disable=too-many-instance-attributes
             updated[authzr] = updated_authzr
 
             # pylint: disable=no-member
-            if updated_authzr.body.status != messages.STATUS_VALID:
+            if updated_authzr.body.status not in (
+                    messages.STATUS_VALID, messages.STATUS_INVALID):
                 # push back to the priority queue, with updated retry_after
                 heapq.heappush(waiting, (self.retry_after(
                     response, default=mintime), authzr))
+
+        if not max_attempts or any(authzr.body.status == messages.STATUS_INVALID
+                                   for authzr in six.itervalues(updated)):
+            raise errors.PollError(waiting, updated)
 
         updated_authzrs = tuple(updated[authzr] for authzr in authzrs)
         return self.request_issuance(csr, updated_authzrs), updated_authzrs

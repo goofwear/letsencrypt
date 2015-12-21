@@ -4,6 +4,7 @@ import os
 
 import zope.component
 
+from letsencrypt import errors
 from letsencrypt import interfaces
 from letsencrypt import le_util
 from letsencrypt.display import util as display_util
@@ -34,7 +35,15 @@ def choose_plugin(prepared, question):
             question, opts, help_label="More Info")
 
         if code == display_util.OK:
-            return prepared[index]
+            plugin_ep = prepared[index]
+            if plugin_ep.misconfigured:
+                util(interfaces.IDisplay).notification(
+                    "The selected plugin encountered an error while parsing "
+                    "your server configuration and cannot be used. The error "
+                    "was:\n\n{0}".format(plugin_ep.prepare()),
+                    height=display_util.HEIGHT, pause=False)
+            else:
+                return plugin_ep
         elif code == display_util.HELP:
             if prepared[index].misconfigured:
                 msg = "Reported Error: %s" % prepared[index].prepare()
@@ -115,22 +124,36 @@ def pick_configurator(
         (interfaces.IAuthenticator, interfaces.IInstaller))
 
 
-def get_email():
+def get_email(more=False, invalid=False):
     """Prompt for valid email address.
+
+    :param bool more: explain why the email is strongly advisable, but how to
+        skip it
+    :param bool invalid: true if the user just typed something, but it wasn't
+        a valid-looking email
 
     :returns: Email or ``None`` if cancelled by user.
     :rtype: str
 
     """
-    while True:
-        code, email = zope.component.getUtility(interfaces.IDisplay).input(
-            "Enter email address (used for urgent notices and lost key recovery)")
+    msg = "Enter email address (used for urgent notices and lost key recovery)"
+    if invalid:
+        msg = "There seem to be problems with that address. " + msg
+    if more:
+        msg += ('\n\nIf you really want to skip this, you can run the client with '
+                '--register-unsafely-without-email but make sure you backup your '
+                'account key from /etc/letsencrypt/accounts\n\n')
+    code, email = zope.component.getUtility(interfaces.IDisplay).input(msg)
 
-        if code == display_util.OK:
-            if le_util.safe_email(email):
-                return email
+    if code == display_util.OK:
+        if le_util.safe_email(email):
+            return email
         else:
-            return None
+            # TODO catch the server's ACME invalid email address error, and
+            # make a similar call when that happens
+            return get_email(more=True, invalid=(email != ""))
+    else:
+        return None
 
 
 def choose_account(accounts):
@@ -165,7 +188,8 @@ def choose_names(installer):
         logger.debug("No installer, picking names manually")
         return _choose_names_manually()
 
-    names = list(installer.get_all_names())
+    domains = list(installer.get_all_names())
+    names = get_valid_domains(domains)
 
     if not names:
         manual = util(interfaces.IDisplay).yesno(
@@ -185,6 +209,24 @@ def choose_names(installer):
         return names
     else:
         return []
+
+
+def get_valid_domains(domains):
+    """Helper method for choose_names that implements basic checks
+     on domain names
+
+    :param list domains: Domain names to validate
+    :return: List of valid domains
+    :rtype: list
+    """
+    valid_domains = []
+    for domain in domains:
+        try:
+            le_util.check_domain_sanity(domain)
+            valid_domains.append(domain)
+        except errors.ConfigurationError:
+            continue
+    return valid_domains
 
 
 def _filter_names(names):
@@ -211,7 +253,41 @@ def _choose_names_manually():
         "Please enter in your domain name(s) (comma and/or space separated) ")
 
     if code == display_util.OK:
-        return display_util.separate_list_input(input_)
+        invalid_domains = dict()
+        retry_message = ""
+        try:
+            domain_list = display_util.separate_list_input(input_)
+        except UnicodeEncodeError:
+            domain_list = []
+            retry_message = (
+                "Internationalized domain names are not presently "
+                "supported.{0}{0}Would you like to re-enter the "
+                "names?{0}").format(os.linesep)
+
+        for domain in domain_list:
+            try:
+                le_util.check_domain_sanity(domain)
+            except errors.ConfigurationError as e:
+                invalid_domains[domain] = e.message
+
+        if len(invalid_domains):
+            retry_message = (
+                "One or more of the entered domain names was not valid:"
+                "{0}{0}").format(os.linesep)
+            for domain in invalid_domains:
+                retry_message = retry_message + "{1}: {2}{0}".format(
+                    os.linesep, domain, invalid_domains[domain])
+            retry_message = retry_message + (
+                "{0}Would you like to re-enter the names?{0}").format(
+                    os.linesep)
+
+        if retry_message:
+            # We had error in input
+            retry = util(interfaces.IDisplay).yesno(retry_message)
+            if retry:
+                return _choose_names_manually()
+        else:
+            return domain_list
     return []
 
 
@@ -224,7 +300,7 @@ def success_installation(domains):
 
     """
     util(interfaces.IDisplay).notification(
-        "Congratulations! You have successfully enabled {0}!{1}{1}"
+        "Congratulations! You have successfully enabled {0}{1}{1}"
         "You should test your configuration at:{1}{2}".format(
             _gen_https_names(domains),
             os.linesep,

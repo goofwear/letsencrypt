@@ -1,6 +1,8 @@
 """Tests for letsencrypt.plugins.webroot."""
+import errno
 import os
 import shutil
+import stat
 import tempfile
 import unittest
 
@@ -23,7 +25,7 @@ class AuthenticatorTest(unittest.TestCase):
     """Tests for letsencrypt.plugins.webroot.Authenticator."""
 
     achall = achallenges.KeyAuthorizationAnnotatedChallenge(
-        challb=acme_util.HTTP01_P, domain=None, account_key=KEY)
+        challb=acme_util.HTTP01_P, domain="thing.com", account_key=KEY)
 
     def setUp(self):
         from letsencrypt.plugins.webroot import Authenticator
@@ -31,9 +33,9 @@ class AuthenticatorTest(unittest.TestCase):
         self.validation_path = os.path.join(
             self.path, ".well-known", "acme-challenge",
             "ZXZhR3hmQURzNnBTUmIyTEF2OUlaZjE3RHQzanV4R0orUEN0OTJ3citvQQ")
-        self.config = mock.MagicMock(webroot_path=self.path)
+        self.config = mock.MagicMock(webroot_path=self.path,
+                                     webroot_map={"thing.com": self.path})
         self.auth = Authenticator(self.config, "webroot")
-        self.auth.prepare()
 
     def tearDown(self):
         shutil.rmtree(self.path)
@@ -46,14 +48,16 @@ class AuthenticatorTest(unittest.TestCase):
     def test_add_parser_arguments(self):
         add = mock.MagicMock()
         self.auth.add_parser_arguments(add)
-        self.assertEqual(1, add.call_count)
+        self.assertEqual(0, add.call_count)  # args moved to cli.py!
 
     def test_prepare_bad_root(self):
         self.config.webroot_path = os.path.join(self.path, "null")
+        self.config.webroot_map["thing.com"] = self.config.webroot_path
         self.assertRaises(errors.PluginError, self.auth.prepare)
 
     def test_prepare_missing_root(self):
         self.config.webroot_path = None
+        self.config.webroot_map = {}
         self.assertRaises(errors.PluginError, self.auth.prepare)
 
     def test_prepare_full_root_exists(self):
@@ -66,7 +70,41 @@ class AuthenticatorTest(unittest.TestCase):
         self.assertRaises(errors.PluginError, self.auth.prepare)
         os.chmod(self.path, 0o700)
 
+    @mock.patch("letsencrypt.plugins.webroot.os.chown")
+    def test_failed_chown_eacces(self, mock_chown):
+        mock_chown.side_effect = OSError(errno.EACCES, "msg")
+        self.auth.prepare()  # exception caught and logged
+
+    @mock.patch("letsencrypt.plugins.webroot.os.chown")
+    def test_failed_chown_not_eacces(self, mock_chown):
+        mock_chown.side_effect = OSError()
+        self.assertRaises(errors.PluginError, self.auth.prepare)
+
+    def test_prepare_permissions(self):
+        self.auth.prepare()
+
+        # Remove exec bit from permission check, so that it
+        # matches the file
+        self.auth.perform([self.achall])
+        path_permissions = stat.S_IMODE(os.stat(self.validation_path).st_mode)
+        self.assertEqual(path_permissions, 0o644)
+
+        # Check permissions of the directories
+
+        for dirpath, dirnames, _ in os.walk(self.path):
+            for directory in dirnames:
+                full_path = os.path.join(dirpath, directory)
+                dir_permissions = stat.S_IMODE(os.stat(full_path).st_mode)
+                self.assertEqual(dir_permissions, 0o755)
+
+        parent_gid = os.stat(self.path).st_gid
+        parent_uid = os.stat(self.path).st_uid
+
+        self.assertEqual(os.stat(self.validation_path).st_gid, parent_gid)
+        self.assertEqual(os.stat(self.validation_path).st_uid, parent_uid)
+
     def test_perform_cleanup(self):
+        self.auth.prepare()
         responses = self.auth.perform([self.achall])
         self.assertEqual(1, len(responses))
         self.assertTrue(os.path.exists(self.validation_path))

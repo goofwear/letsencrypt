@@ -4,11 +4,10 @@ import urlparse
 
 import zope.interface
 
-from acme import challenges
-
 from letsencrypt import constants
 from letsencrypt import errors
 from letsencrypt import interfaces
+from letsencrypt import le_util
 
 
 class NamespaceConfig(object):
@@ -37,10 +36,12 @@ class NamespaceConfig(object):
     def __init__(self, namespace):
         self.namespace = namespace
 
-        if self.http01_port == self.tls_sni_01_port:
-            raise errors.Error(
-                "Trying to run http-01 and tls-sni-01 "
-                "on the same port ({0})".format(self.tls_sni_01_port))
+        self.namespace.config_dir = os.path.abspath(self.namespace.config_dir)
+        self.namespace.work_dir = os.path.abspath(self.namespace.work_dir)
+        self.namespace.logs_dir = os.path.abspath(self.namespace.logs_dir)
+
+        # Check command line parameters sanity, and error out in case of problem.
+        check_config_sanity(self)
 
     def __getattr__(self, name):
         return getattr(self.namespace, name)
@@ -77,13 +78,6 @@ class NamespaceConfig(object):
         return os.path.join(
             self.namespace.work_dir, constants.TEMP_CHECKPOINT_DIR)
 
-    @property
-    def http01_port(self):  # pylint: disable=missing-docstring
-        if self.namespace.http01_port is not None:
-            return self.namespace.http01_port
-        else:
-            return challenges.HTTP01Response.PORT
-
 
 class RenewerConfiguration(object):
     """Configuration wrapper for renewer."""
@@ -111,3 +105,23 @@ class RenewerConfiguration(object):
     def renewer_config_file(self):  # pylint: disable=missing-docstring
         return os.path.join(
             self.namespace.config_dir, constants.RENEWER_CONFIG_FILENAME)
+
+
+def check_config_sanity(config):
+    """Validate command line options and display error message if
+    requirements are not met.
+
+    :param config: IConfig instance holding user configuration
+    :type args: :class:`letsencrypt.interfaces.IConfig`
+
+    """
+    # Port check
+    if config.http01_port == config.tls_sni_01_port:
+        raise errors.ConfigurationError(
+            "Trying to run http-01 and tls-sni-01 "
+            "on the same port ({0})".format(config.tls_sni_01_port))
+
+    # Domain checks
+    if config.namespace.domains is not None:
+        for domain in config.namespace.domains:
+            le_util.check_domain_sanity(domain)

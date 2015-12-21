@@ -691,6 +691,10 @@ class RenewableCertTests(BaseRenewableCertTest):
         self.test_rc.configfile["renewalparams"]["tls_sni_01_port"] = "4430"
         self.test_rc.configfile["renewalparams"]["http01_port"] = "1234"
         self.test_rc.configfile["renewalparams"]["account"] = "abcde"
+        self.test_rc.configfile["renewalparams"]["domains"] = ["example.com"]
+        self.test_rc.configfile["renewalparams"]["config_dir"] = "config"
+        self.test_rc.configfile["renewalparams"]["work_dir"] = "work"
+        self.test_rc.configfile["renewalparams"]["logs_dir"] = "logs"
         mock_auth = mock.MagicMock()
         mock_pd.PluginsRegistry.find_all.return_value = {"apache": mock_auth}
         # Fails because "fake" != "apache"
@@ -760,6 +764,8 @@ class RenewableCertTests(BaseRenewableCertTest):
 
     def test_bad_config_file(self):
         from letsencrypt import renewer
+        os.unlink(os.path.join(self.cli_config.renewal_configs_dir,
+                               "example.org.conf"))
         with open(os.path.join(self.cli_config.renewal_configs_dir,
                                "bad.conf"), "w") as f:
             f.write("incomplete = configfile\n")
